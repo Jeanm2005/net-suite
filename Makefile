@@ -8,7 +8,7 @@ rust:
 
 c:
 	cd ebpf-filter && make
-	mkdir -p bin && cp ebpf-filter/xdp_drop.o bin/
+	mkdir -p bin && cp ebpf-filter/xdp_drop.o ebpf-filter/ebpf-loader bin/
 
 go:
 	cd network-orchestrator && go build -o ../bin/net-orchestrator main.go

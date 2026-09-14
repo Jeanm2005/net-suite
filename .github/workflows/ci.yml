@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build core-scanner
+        working-directory: core-scanner
+        run: cargo build --release
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Build network-orchestrator
+        working-directory: network-orchestrator
+        run: go build -o ../bin/net-orchestrator main.go
+
+  ebpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install eBPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev libelf-dev
+      - name: Build ebpf-filter
+        working-directory: ebpf-filter
+        run: make
+
+  autofix:
+    needs: [rust, go, ebpf]
+    if: >
+      always() &&
+      !startsWith(github.ref_name, 'autofix/') &&
+      !startsWith(github.head_ref, 'autofix/') &&
+      (needs.rust.result == 'failure' || needs.go.result == 'failure' || needs.ebpf.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install eBPF toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev libelf-dev
+
+      - name: Identify failing component and fetch its log
+        id: failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ needs.rust.result }}" = "failure" ]; then echo "component=rust" >> "$GITHUB_OUTPUT"; fi
+          if [ "${{ needs.go.result }}" = "failure" ]; then echo "component=go" >> "$GITHUB_OUTPUT"; fi
+          if [ "${{ needs.ebpf.result }}" = "failure" ]; then echo "component=ebpf" >> "$GITHUB_OUTPUT"; fi
+          gh run view ${{ github.run_id }} --log-failed > failure_log.txt
+
+      - name: Install autofix dependencies
+        run: pip install anthropic
+
+      - name: Ask Claude to fix and verify the build
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python .github/scripts/autofix.py "${{ steps.failure.outputs.component }}" failure_log.txt
+
+      - name: Open PR with the fix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "net-suite-autofix"
+          git config user.email "autofix@users.noreply.github.com"
+          BRANCH="autofix/run-${{ github.run_id }}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "autofix: repair ${{ steps.failure.outputs.component }} build (run ${{ github.run_id }})"
+          git push origin "$BRANCH"
+
+          STATUS=$(cat autofix_status.txt)
+          TAG="⚠️ UNVERIFIED"
+          if [ "$STATUS" = "verified" ]; then TAG="✅ VERIFIED"; fi
+
+          {
+            cat autofix_summary.txt
+            echo
+            echo "Original failure log (tail):"
+            echo '```'
+            tail -n 60 failure_log.txt
+            echo '```'
+            echo
+            echo "Generated automatically after CI failed on the ${{ steps.failure.outputs.component }} build. Not auto-merged — review before merging, especially for changes touching ebpf-filter."
+          } > pr_body.txt
+
+          gh pr create \
+            --title "$TAG Autofix: ${{ steps.failure.outputs.component }} build failure (run ${{ github.run_id }})" \
+            --body-file pr_body.txt \
+            --base main --head "$BRANCH"
