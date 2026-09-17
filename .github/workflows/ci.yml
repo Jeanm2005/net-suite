@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchains@stable
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build core-scanner
         working-directory: core-scanner
         run: |
