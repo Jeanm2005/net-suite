@@ -1,5 +1,7 @@
 mod banner;
 mod fingerprint;
+mod flow_tracker;
+mod ipc;
 mod packet_capture;
 mod scanner;
 
@@ -12,42 +14,59 @@ use tokio::sync::Semaphore;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Network Analysis & Diagnostics Utility")]
 struct Args {
-    /// Target IP address to scan
     #[arg(short, long)]
     target: Option<IpAddr>,
 
-    /// Starting port number
     #[arg(short = 's', long, default_value_t = 1)]
     start_port: u16,
 
-    /// Ending port number
     #[arg(short = 'e', long, default_value_t = 1024)]
     end_port: u16,
 
-    /// Maximum concurrent connection probes
     #[arg(short, long, default_value_t = 200)]
     concurrency: usize,
 
-    /// Monitor live network headers on an interface (e.g., eth0)
     #[arg(short, long)]
     monitor: Option<String>,
+
+    /// Run as an IPC daemon on a Unix socket, accepting JSON scan requests
+    #[arg(short, long)]
+    daemon: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    // Route 1: Live Interface Packet Monitor Mode
+    if let Some(socket_path) = args.daemon {
+        ipc::run_daemon(&socket_path).await;
+        return;
+    }
+
     if let Some(interface) = args.monitor {
+        let tracker = flow_tracker::FlowTracker::new();
+        let reporter_tracker = Arc::clone(&tracker);
+
+        // Every 10s, drain accumulated per-host counters into feature vectors
+        // and print them as JSON lines.
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(10));
+            for features in reporter_tracker.drain_window() {
+                match serde_json::to_string(&features) {
+                    Ok(json) => println!("[flow] {}", json),
+                    Err(e) => eprintln!("[flow] serialize error: {}", e),
+                }
+            }
+        });
+
         tokio::task::spawn_blocking(move || {
-            packet_capture::monitor_interface(&interface);
+            packet_capture::monitor_interface(&interface, tracker);
         })
         .await
         .unwrap();
         return;
     }
 
-    // Route 2: Port Scanner Mode
     if let Some(target) = args.target {
         let timeout_dur = Duration::from_millis(500);
         let semaphore = Arc::new(Semaphore::new(args.concurrency));
@@ -57,16 +76,13 @@ async fn main() {
         println!("--------------------------------------------------");
 
         let mut tasks = vec![];
-
         for port in args.start_port..=args.end_port {
             let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
-
             let task = tokio::spawn(async move {
                 let res = scanner::scan_port(target, port, timeout_dur).await;
                 drop(permit);
                 res
             });
-
             tasks.push(task);
         }
 
@@ -82,6 +98,6 @@ async fn main() {
         println!("--------------------------------------------------");
         println!("Execution finished.");
     } else {
-        println!("Error: Must provide either --target <IP> or --monitor <INTERFACE>");
+        println!("Error: Must provide either --target <IP>, --monitor <INTERFACE>, or --daemon <SOCKET_PATH>");
     }
 }

@@ -20,6 +20,10 @@ func main() {
 	rangeFlag := flag.String("range", "", "CIDR range to sweep, e.g. 192.168.1.0/24")
 	concurrency := flag.Int("concurrency", 256, "max concurrent probes")
 	timeoutMs := flag.Int("timeout", 300, "per-host probe timeout in milliseconds")
+	scanLive := flag.Bool("scan-live", false, "after sweeping, port-scan every live host via the core-scanner daemon")
+	scannerSocket := flag.String("scanner-socket", "/tmp/net-suite-scanner.sock", "path to the core-scanner daemon's Unix socket")
+	scanStartPort := flag.Int("scan-start-port", 1, "start port for follow-up scans (with --scan-live)")
+	scanEndPort := flag.Int("scan-end-port", 1024, "end port for follow-up scans (with --scan-live)")
 	flag.Parse()
 
 	if *rangeFlag == "" {
@@ -82,6 +86,38 @@ func main() {
 
 	fmt.Println("--------------------------------------------------")
 	fmt.Printf("Sweep finished: %d/%d hosts responded\n", len(alive), len(hosts))
+
+	if !*scanLive || len(alive) == 0 {
+		return
+	}
+
+	fmt.Println("--------------------------------------------------")
+	fmt.Printf("Scanning %d live host(s) via core-scanner daemon at %s (ports %d-%d)\n",
+		len(alive), *scannerSocket, *scanStartPort, *scanEndPort)
+	fmt.Println("--------------------------------------------------")
+
+	for _, ip := range alive {
+		resp, err := scanViaDaemon(*scannerSocket, ip, *scanStartPort, *scanEndPort)
+		if err != nil {
+			fmt.Printf("[!] %-15s | scan failed: %v\n", ip, err)
+			continue
+		}
+		if resp.Error != nil {
+			fmt.Printf("[!] %-15s | daemon error: %s\n", ip, *resp.Error)
+			continue
+		}
+		if len(resp.OpenPorts) == 0 {
+			fmt.Printf("[ ] %-15s | no open ports in range\n", ip)
+			continue
+		}
+		for _, p := range resp.OpenPorts {
+			banner := "None / Silent"
+			if p.Banner != nil {
+				banner = *p.Banner
+			}
+			fmt.Printf("[+] %-15s | Port %-5d | OPEN | Banner: %s\n", ip, p.Port, banner)
+		}
+	}
 }
 
 func expandHosts(prefix netip.Prefix, bits int) []string {
@@ -100,9 +136,6 @@ func expandHosts(prefix netip.Prefix, bits int) []string {
 	return hosts
 }
 
-// canOpenICMP checks once, up front, whether this process can open a raw
-// ICMP socket at all, so the whole sweep can pick a strategy instead of
-// failing silently host by host.
 func canOpenICMP() bool {
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -112,12 +145,6 @@ func canOpenICMP() bool {
 	return true
 }
 
-// pingICMP sends one ICMP echo request and waits for a matching reply.
-// It opens its own socket per call instead of sharing one across goroutines:
-// a raw ICMP socket receives a copy of every inbound ICMP packet on the
-// host regardless of which peer it was destined for, so concurrent reads
-// on a shared socket can steal each other's replies. Filtering by peer
-// address below is what makes per-call sockets safe to run concurrently.
 func pingICMP(ip string, timeout time.Duration, seq int) bool {
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -157,9 +184,9 @@ func pingICMP(ip string, timeout time.Duration, seq int) bool {
 			return false
 		}
 		if peer.String() != ip {
-			continue // some other host's reply landed on this socket; keep waiting
+			continue
 		}
-		rm, err := icmp.ParseMessage(1, reply[:n]) // 1 = ICMPv4 protocol number
+		rm, err := icmp.ParseMessage(1, reply[:n])
 		if err != nil {
 			continue
 		}
@@ -169,8 +196,6 @@ func pingICMP(ip string, timeout time.Duration, seq int) bool {
 	}
 }
 
-// isAliveTCP treats a host as live if a TCP handshake completes, or if the
-// connection is actively refused — a refusal still proves the IP answered.
 func isAliveTCP(ip string, timeout time.Duration) bool {
 	for _, port := range []string{"80", "443", "22", "445"} {
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), timeout)
