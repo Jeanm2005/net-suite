@@ -1,0 +1,4 @@
+go: downloading go1.26.0 (linux/amd64)
+go: downloading golang.org/x/net v0.59.0
+go: downloading golang.org/x/sys v0.48.0
+main.go:5:2: package flags is not in std (/home/runner/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.0.linux-amd64/src/flags)

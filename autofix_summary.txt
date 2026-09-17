@@ -1,0 +1,6 @@
+Component: go
+Status: verified
+
+Files changed:
+- network-orchestrator/ipc.go
+- network-orchestrator/main.go
