@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"flag"
+	"flags"
 	"fmt"
 	"net"
 	"net/netip"
