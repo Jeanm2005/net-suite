@@ -14,7 +14,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build core-scanner
         working-directory: core-scanner
-        run: cargo build --release
+        run: cargo build --release 2>&1 | tee ../build-log.txt
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-rust
+          path: build-log.txt
 
   go:
     runs-on: ubuntu-latest
@@ -25,7 +31,13 @@ jobs:
           go-version: '1.25'
       - name: Build network-orchestrator
         working-directory: network-orchestrator
-        run: go build -o ../bin/net-orchestrator main.go
+        run: go build -o ../bin/net-orchestrator . 2>&1 | tee ../build-log.txt
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-go
+          path: build-log.txt
 
   ebpf:
     runs-on: ubuntu-latest
@@ -35,7 +47,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev libelf-dev
       - name: Build ebpf-filter
         working-directory: ebpf-filter
-        run: make
+        run: make 2>&1 | tee ../build-log.txt
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-ebpf
+          path: build-log.txt
 
   autofix:
     needs: [rust, go, ebpf]
@@ -63,15 +81,21 @@ jobs:
       - name: Install eBPF toolchain
         run: sudo apt-get update && sudo apt-get install -y clang libbpf-dev libelf-dev
 
-      - name: Identify failing component and fetch its log
+      - name: Identify failing component
         id: failure
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ needs.rust.result }}" = "failure" ]; then echo "component=rust" >> "$GITHUB_OUTPUT"; fi
           if [ "${{ needs.go.result }}" = "failure" ]; then echo "component=go" >> "$GITHUB_OUTPUT"; fi
           if [ "${{ needs.ebpf.result }}" = "failure" ]; then echo "component=ebpf" >> "$GITHUB_OUTPUT"; fi
-          gh run view ${{ github.run_id }} --log-failed > failure_log.txt
+
+      - name: Download failing component's build log
+        uses: actions/download-artifact@v4
+        with:
+          name: build-log-${{ steps.failure.outputs.component }}
+          path: .
+
+      - name: Rename log for the autofix script
+        run: mv build-log.txt failure_log.txt
 
       - name: Install autofix dependencies
         run: pip install anthropic
