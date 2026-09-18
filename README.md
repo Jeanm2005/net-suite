@@ -1,101 +1,121 @@
-# Net-Suite
+# net-suite
 
-A high-performance, modular offensive security and network diagnostics suite built using a polyglot monorepo architecture (**Rust**, **C / eBPF**, and **Go**).
+A network security toolkit built across Rust, Go, C/eBPF, and Python — host discovery, port scanning, kernel-level packet filtering, and a bounded ML layer for flagging anomalous traffic. Built in WSL2 (Ubuntu on Windows 11) as a systems/networking-focused project, with a narrow ML layer.
 
-## Architecture & System Design
+## Architecture
 
-`net-suite` leverages each language for its specific domain strengths:
+```
+network-orchestrator (Go)          core-scanner (Rust)
+  CIDR sweep, ICMP-first     --->    Unix-socket daemon:
+  host discovery, then                port scan + banner
+  hands live hosts to the             grab + OS fingerprint
+  scanner daemon over IPC             + live traffic capture
+                                              |
+                                              v
+                                    flow_tracker: per-host
+                                    packets/sec, bytes/sec,
+                                    unique ports, SYN ratio,
+                                    protocol mix, every 10s
+                                              |
+                                              v
+                                    ml-scorer (Python):
+                                    IsolationForest baseline
+                                    per host, flags outliers
+                                    (flag-only, no auto-action)
 
-```text
-                      +----------------------------------+
-                      |         Linux Kernel             |
-                      |                                  |
-                      |  [ eBPF / XDP Filter (C) ]       |
-                      |   - Zero-copy packet dropping    |
-                      |   - SKB/Generic XDP support      |
-                      +----------------+-----------------+
-                                       |
-                   eBPF Map / Unix Socket (IPC)
-                                       |
-      +--------------------------------+--------------------------------+
-      |                                                                 |
-      v                                                                 v
-+-----------------------------+                           +-----------------------------+
-|    core-scanner (Rust)      |                           | network-orchestrator (Go)   |
-|                             |                           |                             |
-| - Async TCP/UDP probing     | <--- IPC / Shared JSON ---> | - Concurrent CIDR sweeper   |
-| - Banner grabbing & sniffer |                           | - Target state tracking     |
-| - OS fingerprinting         |                           | - Orchestration & API       |
-+-----------------------------+                           +-----------------------------+
+ebpf-filter (C/XDP)
+  Kernel-level TCP-port drop, configurable via a BPF hash map
+  (not hardcoded) — loaded/unloaded independently of the above
+```
 
-Directory Structure
-core-scanner/ (Rust): Asynchronous port scanner (tokio), service banner parser, packet capture engine (pnet), and TTL fingerprinting.
+Each component is independently runnable. Nothing here auto-wires the ML layer's flags into the kernel filter yet — that's a deliberate, not-yet-built step (see Status below).
 
-ebpf-filter/ (C): Kernel-space XDP packet filter program with user-space C lifecycle manager (libbpf).
+## Components
 
-network-orchestrator/ (Go): CIDR subnet sweeper using concurrent goroutines for rapid active host discovery.
+### `core-scanner` (Rust)
 
-bin/: Central target output directory for cross-compiled suite binaries.
+- **CLI scan mode**: `--target <IP> --start-port N --end-port N` — concurrent async port scan with banner grabbing and TTL-based OS fingerprinting.
+- **Daemon mode**: `--daemon <socket-path>` — runs as a persistent Unix-socket JSON service. Accepts `{"target": "...", "start_port": N, "end_port": N}`, returns open ports + banners. Built so `network-orchestrator` can drive it automatically.
+- **Monitor mode**: `--monitor <interface>` — live packet capture (requires root). Prints per-packet traffic lines and, every 10 seconds, a `[flow] {...}` JSON line per source host with aggregated traffic features (see `ml-scorer` below).
 
-Build Requirements
-Linux Kernel with eBPF support (Ubuntu / WSL2 supported)
+### `network-orchestrator` (Go)
 
-clang, llvm, libbpf-dev, gcc, make
+- CIDR sweep with **ICMP-first, TCP-fallback** host discovery (a TCP `ECONNREFUSED` still counts as "host is up" even if the specific port is closed).
+- Bounded concurrency via a semaphore — avoids spawning one goroutine per host unconditionally on large ranges. Refuses ranges larger than a `/20` outright.
+- `--scan-live` flag: after sweeping, automatically calls `core-scanner`'s daemon over the Unix socket for every live host found, producing a single sweep-then-scan pipeline instead of two manual steps.
 
-Rust toolchain (cargo, rustc)
+### `ebpf-filter` (C / eBPF / XDP)
 
-Go (go compiler 1.20+)
+- `xdp_drop.c`: an XDP program that drops incoming TCP packets whose destination port is in a BPF hash map (`drop_ports`) — configurable at load time, not compiled in.
+- `loader.c`: attaches/detaches the XDP program on a given interface. `ebpf-loader <iface> load [port...]` populates the map with the given ports (defaults to port 80 if none given); `ebpf-loader <iface> unload` detaches cleanly. Runs in the foreground until Ctrl+C.
 
-# Compile all modules into ./bin
-make
+### `ml-scorer` (Python)
 
-# Run the Go network sweeper
-./bin/net-orchestrator --range 192.168.1.0/24
+- Reads `[flow] {...}` JSON lines from `core-scanner --monitor`'s stdout.
+- Maintains a rolling per-host history and trains an `IsolationForest` once 30 windows (~5 minutes) of history exist per host, retraining every 60 windows thereafter.
+- Flags outlier windows to stdout with a severity score and a best-effort guess at which feature deviated most; normal windows log to stderr for visibility during development.
+- **Flag-only.** Nothing here blocks or drops traffic automatically — see Status.
 
-# Load the eBPF packet filter (Generic mode for virtualized environments)
-sudo ./bin/ebpf-loader eth0 load
+## Build
 
----
+```bash
+make rust   # builds core-scanner, copies binary to bin/
+make c      # builds xdp_drop.o + ebpf-loader, copies both to bin/
+make go     # builds network-orchestrator, copies binary to bin/
+make all    # all three
+make clean  # removes build artifacts and bin/
+```
 
-### Step 3: Project Handoff Prompt
+`ml-scorer` isn't part of the Makefile — it's a plain Python script:
 
-Save the following text block. You can paste this as your opening prompt in any future chat session to restore 100% of the project context instantly.
+```bash
+cd ml-scorer
+pip install -r requirements.txt --break-system-packages
+```
 
-***
+## Usage
 
-```text
-[PROJECT HANDOFF PROMPT: NET-SUITE]
+Sweep a subnet and auto-scan every live host found:
 
-1. FINAL PRODUCT VISION
-We are building "Net-Suite", a modular, high-performance offensive security and network diagnostics tool using a polyglot architecture:
-- Rust (core-scanner): Async port scanner, raw packet capture (pnet), banner grabbing, and OS fingerprinting.
-- C / eBPF (ebpf-filter): Kernel-space XDP packet filter (dropping TCP port 80 traffic) and a user-space loader binary using libbpf.
-- Go (network-orchestrator): Concurrent CIDR subnet sweeper and service orchestrator.
-- System Design: Micro-components connected via Unix Domain Sockets (IPC) and eBPF maps, built via a central root Makefile into ~/net-suite/bin/.
+```bash
+# Terminal 1 — start the scan daemon
+cd core-scanner && ./target/release/port_scanner --daemon /tmp/net-suite-scanner.sock
 
-2. COMPLETED SO FAR
-- Environment: WSL2 (Ubuntu), clang, libbpf-dev, Rust, Go.
-- Repository Layout (~/net-suite):
-  ├── Makefile (root orchestrator)
-  ├── README.md & .gitignore
-  ├── bin/
-  ├── core-scanner/ (Rust: main.rs, scanner.rs, banner.rs, fingerprint.rs, packet_capture.rs)
-  ├── ebpf-filter/ (C: xdp_drop.c, loader.c, Makefile)
-  └── network-orchestrator/ (Go: main.go, go.mod)
-- ebpf-filter details: Built xdp_drop.o (kernel space) and ebpf-loader (user space) with libbpf.
-- network-orchestrator details: Built concurrent CIDR sweeper with Go worker pools.
+# Terminal 2 — sweep + auto-scan
+sudo ./bin/net-orchestrator --range 192.168.1.0/24 --scan-live --scan-end-port 1024
+```
 
-3. ERRORS ENCOUNTERED & RESOLVED
-- Header inclusion issues: Resolved missing `asm/types.h` by adding `-I/usr/include/x86_64-linux-gnu` to BPF_CFLAGS.
-- Target library conflicts: Removed `<arpa/inet.h>` and standard glibc includes in kernel space; replaced with `<bpf/bpf_endian.h>` (`bpf_htons`) and `<linux/in.h>` (`IPPROTO_TCP`).
-- WSL2 / Hyper-V Driver Limit: Native XDP failed on `eth0` with `hv_netvsc: XDP: not support LRO`. Resolved by using `XDP_FLAGS_SKB_MODE` (Generic XDP mode) in `loader.c` for virtualized interfaces.
+Monitor live traffic and feed it to the anomaly scorer:
 
-4. CURRENT ENVIRONMENT & STATUS
-- Host: WSL2 (Ubuntu) running Linux Kernel 6.x.
-- All three components compile without warnings using `make` at the root directory.
-- Code is pushed to GitHub on branch `main`.
+```bash
+cd core-scanner
+sudo ./target/release/port_scanner --monitor eth0 | python3 ../ml-scorer/anomaly_scorer.py
+```
 
-5. PLANNED NEXT STEPS
-- Update `ebpf-filter/loader.c` to accept command-line flags for toggling between Generic (`XDP_FLAGS_SKB_MODE`) and Native (`XDP_FLAGS_DRV_MODE`) XDP modes.
-- Implement Unix Domain Socket (IPC) IPC communication between Go (`network-orchestrator`) and Rust (`core-scanner`) to pass discovered live IPs dynamically.
-- Expand eBPF maps to pass packet drop statistics back to user space in real time.
+Load the kernel-level filter against specific ports:
+
+```bash
+cd bin
+sudo ./ebpf-loader eth0 load 8080 8443   # drops those two ports
+sudo ./ebpf-loader eth0 unload           # detaches, Ctrl+C also works
+```
+
+## CI/CD
+
+`.github/workflows/ci.yml` builds all three compiled components (Rust, Go, C/eBPF) on every push. On a build failure, a second job downloads that component's build log, asks Claude to propose a fix, applies it, **rebuilds locally to confirm the fix actually works**, and opens a pull request tagged `✅ VERIFIED` or `⚠️ UNVERIFIED` depending on whether the rebuild passed — it never merges automatically. This loop has been tested end-to-end against a real, deliberately introduced build failure.
+
+## Status —
+
+Everything below has been built **and independently validated** against real traffic/hosts:
+
+- Core scanner CLI, daemon mode, and IPC bridge to `network-orchestrator` — confirmed against ground truth (daemon results matched standalone CLI results on the same target).
+- Flow tracker — confirmed emitting correct per-host JSON, correctly separating concurrent traffic sources (including background OS traffic it wasn't deliberately fed).
+- XDP filter — confirmed with a real before/after test: a service on a filtered port was unreachable while the filter was attached and immediately reachable again after detaching.
+- Self-healing CI — confirmed against a real, intentionally introduced build failure; the autofix loop detected it, generated a fix, avoided a symbol collision on its own, verified the rebuild, and the fix was merged.
+
+Known environment quirk: on WSL2/Hyper-V, native XDP attach fails against `hv_netvsc` unless LRO is disabled first (`sudo ethtool -K eth0 lro off`). This is not a code issue,just a driver limitation.
+
+Not yet done:
+- The ML scorer hasn't been run long enough on real traffic to know its actual false-positive rate. `contamination=0.05` in the code is an untuned guess.
+- No automatic enforcement: a flagged anomaly does not currently trigger the eBPF filter, even though the filter's BPF-map design now supports being updated with a port at runtime for exactly this purpose. Wiring that connection is the next major step, deliberately gated behind proving the detector isn't crying wolf first.
+- No automated tests yet for either the Rust/Go logic or the ML scoring logic.
